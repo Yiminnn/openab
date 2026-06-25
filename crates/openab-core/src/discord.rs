@@ -699,8 +699,10 @@ impl EventHandler for Handler {
         let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
+        let mut image_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
+        const IMAGE_COUNT_CAP: u32 = 8; // max images encoded+forwarded per message turn
 
         for attachment in &msg.attachments {
             let mime = attachment.content_type.as_deref().unwrap_or("");
@@ -773,8 +775,13 @@ impl EventHandler for Handler {
                 .await
                 {
                     Ok(block) => {
-                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                        extra_blocks.push(block);
+                        if image_count >= IMAGE_COUNT_CAP {
+                            tracing::warn!(url = %attachment.url, filename = %attachment.filename, count = image_count, "image count cap reached, skipping");
+                        } else {
+                            image_count += 1;
+                            debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                            extra_blocks.push(block);
+                        }
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
                         if media::is_video_file(
