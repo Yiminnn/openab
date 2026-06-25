@@ -846,6 +846,9 @@ pub fn estimate_tokens(prompt: &str, extra_blocks: &[ContentBlock]) -> usize {
         .map(|b| match b {
             ContentBlock::Text { text } => text.len() / CHARS_PER_TOKEN_ESTIMATE + 1,
             ContentBlock::Image { .. } => TOKENS_PER_IMAGE_ESTIMATE,
+            // Documents carry base64-encoded bytes; estimate coarsely from the
+            // encoded payload length, same per-char ratio as text.
+            ContentBlock::Document { data, .. } => data.len() / CHARS_PER_TOKEN_ESTIMATE + 1,
         })
         .sum();
     text_tokens + block_tokens

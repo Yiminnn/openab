@@ -84,11 +84,12 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
-/// A content block for the ACP prompt — either text or image.
+/// A content block for the ACP prompt — text, image, or a raw file document.
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
     Text { text: String },
     Image { media_type: String, data: String },
+    Document { media_type: String, data: String, name: String },
 }
 
 impl ContentBlock {
@@ -103,8 +104,67 @@ impl ContentBlock {
                 "data": data,
                 "mimeType": media_type
             }),
+            ContentBlock::Document {
+                media_type,
+                data,
+                name,
+            } => json!({
+                "type": "document",
+                "data": data,
+                "mimeType": media_type,
+                "name": name
+            }),
         }
     }
+}
+
+/// Read the negotiated `agentCapabilities.promptCapabilities.image` flag from an
+/// `initialize` response result. Returns false (fail-closed) when the key is
+/// absent or not a boolean. Kept as a pure function for unit testing.
+fn parse_supports_image(result: Option<&Value>) -> bool {
+    result
+        .and_then(|r| r.get("agentCapabilities"))
+        .and_then(|c| c.get("promptCapabilities"))
+        .and_then(|p| p.get("image"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Centralized image-capability gate. When the agent does not support image
+/// content (`allow_image == false`), every [`ContentBlock::Image`] is removed
+/// while [`ContentBlock::Text`] blocks are retained in their original order. A
+/// block list with no images is returned untouched, so the text-only path is
+/// byte-identical. Kept as a pure function for unit testing.
+fn gate_image_blocks(mut blocks: Vec<ContentBlock>, allow_image: bool) -> Vec<ContentBlock> {
+    if !allow_image {
+        blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+    }
+    blocks
+}
+
+/// Read the negotiated `agentCapabilities.promptCapabilities.document` flag from
+/// an `initialize` response result. Returns false (fail-closed) when the key is
+/// absent or not a boolean. Kept as a pure function for unit testing.
+fn parse_supports_document(result: Option<&Value>) -> bool {
+    result
+        .and_then(|r| r.get("agentCapabilities"))
+        .and_then(|c| c.get("promptCapabilities"))
+        .and_then(|p| p.get("document"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Centralized document-capability gate. When the agent does not support
+/// document content (`allow_document == false`), every [`ContentBlock::Document`]
+/// is removed while [`ContentBlock::Text`] and [`ContentBlock::Image`] blocks are
+/// retained in their original order. A block list with no documents is returned
+/// untouched, so the text-only and image paths are byte-identical. Kept as a pure
+/// function for unit testing.
+fn gate_document_blocks(mut blocks: Vec<ContentBlock>, allow_document: bool) -> Vec<ContentBlock> {
+    if !allow_document {
+        blocks.retain(|b| !matches!(b, ContentBlock::Document { .. }));
+    }
+    blocks
 }
 
 pub struct AcpConnection {
@@ -117,6 +177,14 @@ pub struct AcpConnection {
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
+    /// Whether the connected agent advertised promptCapabilities.image == true
+    /// during initialize(). Default false: image content blocks are stripped
+    /// from prompts until an agent explicitly negotiates image support.
+    pub supports_image: bool,
+    /// Whether the connected agent advertised promptCapabilities.document == true
+    /// during initialize(). Default false: document content blocks are stripped
+    /// from prompts until an agent explicitly negotiates document support.
+    pub supports_document: bool,
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
@@ -408,6 +476,8 @@ impl AcpConnection {
             notify_tx,
             acp_session_id: None,
             supports_load_session: false,
+            supports_image: false,
+            supports_document: false,
             config_options: Vec::new(),
             last_active: Instant::now(),
             session_reset: false,
@@ -474,9 +544,13 @@ impl AcpConnection {
             .and_then(|c| c.get("loadSession"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.supports_image = parse_supports_image(result);
+        self.supports_document = parse_supports_document(result);
         info!(
             agent = agent_name,
             load_session = self.supports_load_session,
+            image = self.supports_image,
+            document = self.supports_document,
             "initialized"
         );
         Ok(())
@@ -572,6 +646,33 @@ impl AcpConnection {
         content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
         self.last_active = Instant::now();
+
+        // Single centralized image-capability gate. Every transport (Discord
+        // batched, gateway, handle_message) funnels through here, so gating in
+        // one place covers all callers. When the agent did not negotiate image
+        // support, strip image blocks; text-only prompts are unaffected.
+        let before = content_blocks.len();
+        let content_blocks = gate_image_blocks(content_blocks, self.supports_image);
+        if content_blocks.len() != before {
+            tracing::warn!(
+                stripped = before - content_blocks.len(),
+                supports_image = self.supports_image,
+                "agent did not advertise promptCapabilities.image; dropping image content blocks"
+            );
+        }
+
+        // Centralized document-capability gate, mirroring the image gate above.
+        // When the agent did not negotiate document support, strip document
+        // blocks; text-only and image prompts are unaffected.
+        let before = content_blocks.len();
+        let content_blocks = gate_document_blocks(content_blocks, self.supports_document);
+        if content_blocks.len() != before {
+            tracing::warn!(
+                stripped = before - content_blocks.len(),
+                supports_document = self.supports_document,
+                "agent did not advertise promptCapabilities.document; dropping document content blocks"
+            );
+        }
 
         let session_id = self
             .acp_session_id
@@ -699,8 +800,216 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
-    use serde_json::json;
+    use super::{
+        build_agent_env, build_permission_response, gate_document_blocks, gate_image_blocks,
+        parse_supports_document, parse_supports_image, pick_best_option, ContentBlock,
+    };
+    use serde_json::{json, Value};
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text { text: t.to_string() }
+    }
+
+    fn image(mime: &str, data: &str) -> ContentBlock {
+        ContentBlock::Image {
+            media_type: mime.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn document(mime: &str, data: &str, name: &str) -> ContentBlock {
+        ContentBlock::Document {
+            media_type: mime.to_string(),
+            data: data.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn image_block_serializes_to_canonical_acp_shape() {
+        let block = image("image/png", "QUJD");
+        assert_eq!(
+            block.to_json(),
+            json!({"type": "image", "data": "QUJD", "mimeType": "image/png"})
+        );
+    }
+
+    #[test]
+    fn gate_strips_images_when_capability_absent_and_preserves_text_order() {
+        let blocks = vec![
+            text("first"),
+            image("image/png", "AAA"),
+            text("second"),
+            image("image/jpeg", "BBB"),
+            text("third"),
+        ];
+
+        let gated = gate_image_blocks(blocks, false);
+
+        let texts: Vec<String> = gated
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::Image { .. } => panic!("image block survived the gate"),
+                ContentBlock::Document { .. } => panic!("document block present unexpectedly"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn gate_is_noop_for_text_only_blocks() {
+        // The text-only path must be byte-identical: same blocks, same order,
+        // regardless of the capability flag.
+        let make = || vec![text("a"), text("b"), text("c")];
+        let off: Vec<Value> = gate_image_blocks(make(), false)
+            .iter()
+            .map(|b| b.to_json())
+            .collect();
+        let on: Vec<Value> = gate_image_blocks(make(), true)
+            .iter()
+            .map(|b| b.to_json())
+            .collect();
+        let expected: Vec<Value> = make().iter().map(|b| b.to_json()).collect();
+        assert_eq!(off, expected);
+        assert_eq!(on, expected);
+    }
+
+    #[test]
+    fn gate_passes_images_through_when_capability_present() {
+        let blocks = vec![text("hi"), image("image/png", "AAA")];
+        let gated = gate_image_blocks(blocks, true);
+        assert_eq!(gated.len(), 2);
+        assert!(matches!(gated[1], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn parse_supports_image_reads_nested_capability() {
+        let result = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"image": true}
+            }
+        });
+        assert!(parse_supports_image(Some(&result)));
+    }
+
+    #[test]
+    fn parse_supports_image_defaults_false_when_key_missing() {
+        let result = json!({"agentCapabilities": {"loadSession": true}});
+        assert!(!parse_supports_image(Some(&result)));
+        assert!(!parse_supports_image(Some(&json!({}))));
+        assert!(!parse_supports_image(None));
+    }
+
+    #[test]
+    fn parse_supports_image_false_when_advertised_false() {
+        let result = json!({
+            "agentCapabilities": {"promptCapabilities": {"image": false}}
+        });
+        assert!(!parse_supports_image(Some(&result)));
+    }
+
+    // --- document content block + capability gate tests (mirror image) ---
+
+    #[test]
+    fn document_block_serializes_to_canonical_acp_shape() {
+        let block = document("application/pdf", "QUJD", "report.pdf");
+        assert_eq!(
+            block.to_json(),
+            json!({
+                "type": "document",
+                "data": "QUJD",
+                "mimeType": "application/pdf",
+                "name": "report.pdf"
+            })
+        );
+    }
+
+    #[test]
+    fn gate_strips_documents_when_capability_absent_and_preserves_text_order() {
+        let blocks = vec![
+            text("first"),
+            document("application/pdf", "AAA", "a.pdf"),
+            text("second"),
+            document("application/zip", "BBB", "b.zip"),
+            text("third"),
+        ];
+
+        let gated = gate_document_blocks(blocks, false);
+
+        let texts: Vec<String> = gated
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("document block survived the gate"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn gate_document_is_noop_for_text_only_blocks() {
+        // The text-only path must be byte-identical: same blocks, same order,
+        // regardless of the capability flag.
+        let make = || vec![text("a"), text("b"), text("c")];
+        let off: Vec<Value> = gate_document_blocks(make(), false)
+            .iter()
+            .map(|b| b.to_json())
+            .collect();
+        let on: Vec<Value> = gate_document_blocks(make(), true)
+            .iter()
+            .map(|b| b.to_json())
+            .collect();
+        let expected: Vec<Value> = make().iter().map(|b| b.to_json()).collect();
+        assert_eq!(off, expected);
+        assert_eq!(on, expected);
+    }
+
+    #[test]
+    fn gate_document_preserves_image_blocks() {
+        // Stripping documents must not disturb image blocks (image path stays intact).
+        let blocks = vec![text("hi"), image("image/png", "AAA"), document("application/pdf", "BBB", "d.pdf")];
+        let gated = gate_document_blocks(blocks, false);
+        assert_eq!(gated.len(), 2);
+        assert!(matches!(gated[0], ContentBlock::Text { .. }));
+        assert!(matches!(gated[1], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn gate_passes_documents_through_when_capability_present() {
+        let blocks = vec![text("hi"), document("application/pdf", "AAA", "d.pdf")];
+        let gated = gate_document_blocks(blocks, true);
+        assert_eq!(gated.len(), 2);
+        assert!(matches!(gated[1], ContentBlock::Document { .. }));
+    }
+
+    #[test]
+    fn parse_supports_document_reads_nested_capability() {
+        let result = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"document": true}
+            }
+        });
+        assert!(parse_supports_document(Some(&result)));
+    }
+
+    #[test]
+    fn parse_supports_document_defaults_false_when_key_missing() {
+        let result = json!({"agentCapabilities": {"loadSession": true}});
+        assert!(!parse_supports_document(Some(&result)));
+        assert!(!parse_supports_document(Some(&json!({}))));
+        assert!(!parse_supports_document(None));
+    }
+
+    #[test]
+    fn parse_supports_document_false_when_advertised_false() {
+        let result = json!({
+            "agentCapabilities": {"promptCapabilities": {"document": false}}
+        });
+        assert!(!parse_supports_document(Some(&result)));
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {
