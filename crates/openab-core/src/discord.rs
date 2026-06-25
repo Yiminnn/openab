@@ -765,6 +765,25 @@ impl EventHandler for Handler {
                     extra_blocks.push(block);
                 }
             } else {
+                // Enforce the image cap BEFORE downloading so over-cap images are not
+                // needlessly downloaded/decoded/resized/encoded. Videos are link-only
+                // (no download) and are not counted against the image cap, so they are
+                // still linked when the cap is reached.
+                if image_count >= IMAGE_COUNT_CAP {
+                    if media::is_video_file(&attachment.filename, attachment.content_type.as_deref())
+                    {
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding video attachment link");
+                        extra_blocks.push(video_attachment_block(
+                            &attachment.filename,
+                            attachment.content_type.as_deref(),
+                            u64::from(attachment.size),
+                            &attachment.url,
+                        ));
+                    } else {
+                        tracing::warn!(url = %attachment.url, filename = %attachment.filename, count = image_count, "image count cap reached, skipping");
+                    }
+                    continue;
+                }
                 match media::download_and_encode_image(
                     &attachment.url,
                     attachment.content_type.as_deref(),
@@ -775,13 +794,9 @@ impl EventHandler for Handler {
                 .await
                 {
                     Ok(block) => {
-                        if image_count >= IMAGE_COUNT_CAP {
-                            tracing::warn!(url = %attachment.url, filename = %attachment.filename, count = image_count, "image count cap reached, skipping");
-                        } else {
-                            image_count += 1;
-                            debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                            extra_blocks.push(block);
-                        }
+                        image_count += 1;
+                        debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                        extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
                         if media::is_video_file(
