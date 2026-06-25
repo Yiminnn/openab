@@ -700,9 +700,11 @@ impl EventHandler for Handler {
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         let mut image_count: u32 = 0;
+        let mut doc_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
         const TEXT_FILE_COUNT_CAP: u32 = 5;
         const IMAGE_COUNT_CAP: u32 = 8; // max images encoded+forwarded per message turn
+        const DOC_COUNT_CAP: u32 = 5; // max raw file documents encoded+forwarded per message turn
 
         for attachment in &msg.attachments {
             let mime = attachment.content_type.as_deref().unwrap_or("");
@@ -810,6 +812,27 @@ impl EventHandler for Handler {
                                 u64::from(attachment.size),
                                 &attachment.url,
                             ));
+                        } else {
+                            // Non-image, non-video, non-text, non-audio attachment
+                            // (PDF, office doc, archive, arbitrary binary). Download
+                            // the raw bytes and forward as a document content block so
+                            // the agent receives the file as-is. Enforce the per-turn
+                            // document cap BEFORE downloading, mirroring the image cap.
+                            if doc_count >= DOC_COUNT_CAP {
+                                tracing::warn!(url = %attachment.url, filename = %attachment.filename, count = doc_count, "document count cap reached, skipping");
+                            } else if let Some(block) = media::download_and_encode_file(
+                                &attachment.url,
+                                attachment.content_type.as_deref(),
+                                &attachment.filename,
+                                u64::from(attachment.size),
+                                None,
+                            )
+                            .await
+                            {
+                                doc_count += 1;
+                                debug!(url = %attachment.url, filename = %attachment.filename, "adding document attachment");
+                                extra_blocks.push(block);
+                            }
                         }
                     }
                     Err(e) => {

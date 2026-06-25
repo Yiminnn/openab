@@ -297,6 +297,87 @@ pub async fn download_and_encode_image(
     })
 }
 
+/// Maximum size (declared or downloaded) for a raw file document, in bytes.
+const FILE_MAX_DOWNLOAD: u64 = 30 * 1024 * 1024; // 30 MB
+
+/// Download a file's RAW bytes (no image processing), base64-encode them, and
+/// return a [`ContentBlock::Document`] so the agent receives the file as-is.
+///
+/// This is the catch-all path for attachments that are not image/text/audio
+/// (PDFs, office docs, archives, arbitrary binaries). It enforces a size cap
+/// ([`FILE_MAX_DOWNLOAD`]) both against the declared `size` (fast path, before
+/// any request) and against the actual downloaded body (defense-in-depth), and
+/// returns `None` on any failure so the caller skips the attachment silently.
+///
+/// `mime_hint` populates the document's `media_type`; when absent it falls back
+/// to `application/octet-stream`. `filename` becomes the document `name`.
+///
+/// Pass `auth_token` for platforms that require authentication.
+pub async fn download_and_encode_file(
+    url: &str,
+    mime_hint: Option<&str>,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+) -> Option<ContentBlock> {
+    if url.is_empty() {
+        return None;
+    }
+
+    if size > FILE_MAX_DOWNLOAD {
+        warn!(filename, size, "file exceeds 30MB limit, skipping");
+        return None;
+    }
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(url, error = %e, "file download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(url, status = %resp.status(), "file download failed");
+        return None;
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(url, error = %e, "file body read failed");
+            return None;
+        }
+    };
+
+    // Defense-in-depth: verify actual download size.
+    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
+        warn!(
+            filename,
+            size = bytes.len(),
+            "downloaded file exceeds 30MB limit, skipping"
+        );
+        return None;
+    }
+
+    let media_type = mime_hint
+        .map(strip_mime_params)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let encoded = BASE64.encode(&bytes);
+    debug!(filename, bytes = bytes.len(), %media_type, "file encoded as document block");
+    Some(ContentBlock::Document {
+        media_type,
+        data: encoded,
+        name: filename.to_string(),
+    })
+}
+
 /// Download an audio file and transcribe it via the configured STT provider.
 /// Pass `auth_token` for platforms that require authentication.
 pub async fn download_and_transcribe(
